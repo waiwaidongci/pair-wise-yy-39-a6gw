@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ENTITY, ID_PREFIX, SEAL_STATUSES, STATES
 
 
 class Repository:
@@ -24,6 +24,7 @@ class Repository:
 
     def _create_schema(self) -> None:
         statuses = ",".join("'" + s.replace("'", "''") + "'" for s in STATES)
+        seal_statuses = ",".join("'" + s.replace("'", "''") + "'" for s in SEAL_STATUSES)
         with self.conn:
             self.conn.executescript(f"""
                 CREATE TABLE IF NOT EXISTS items (
@@ -64,6 +65,27 @@ class Repository:
                     previous_hash TEXT NOT NULL,
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS seal_cases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    break_event_id INTEGER NOT NULL,
+                    discovered_by TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    evidence_summary TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ({seal_statuses})),
+                    scope_note TEXT,
+                    confirmed_by TEXT,
+                    confirmed_at TEXT,
+                    resolution_note TEXT,
+                    resolved_by TEXT,
+                    resolved_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS seal_frozen_items (
+                    seal_id INTEGER NOT NULL REFERENCES seal_cases(id) ON DELETE CASCADE,
+                    item_id INTEGER NOT NULL,
+                    PRIMARY KEY (seal_id, item_id)
                 );
             """)
 
@@ -192,23 +214,130 @@ class Repository:
             result.append(item)
         return result
 
-    def verify_audit_chain(self) -> bool:
+    def find_audit_break(self, after_id: int = 0) -> Optional[int]:
+        """返回第一个校验失败事件的id（大于after_id），无则返回None。"""
         from .audit import calculate_hash
         with self._lock:
             rows = self.conn.execute("SELECT * FROM audit_events ORDER BY id").fetchall()
         previous = "GENESIS"
         for row in rows:
-            if row["previous_hash"] != previous:
-                return False
             payload = {
                 "action": row["action"], "entity_type": row["entity_type"],
                 "entity_id": row["entity_id"], "actor": row["actor"],
                 "detail": json.loads(row["detail"]), "created_at": row["created_at"],
             }
-            if calculate_hash(previous, payload) != row["entry_hash"]:
-                return False
+            broken = (row["previous_hash"] != previous
+                      or calculate_hash(previous, payload) != row["entry_hash"])
+            if broken and int(row["id"]) > after_id:
+                return int(row["id"])
             previous = row["entry_hash"]
-        return True
+        return None
+
+    def verify_audit_chain(self) -> bool:
+        return self.find_audit_break() is None
+
+    def undisposed_break(self) -> Optional[int]:
+        """返回尚未被已结清处置单覆盖的断点；结清视为处置了断点及之前的全部异常。"""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT MAX(break_event_id) AS b FROM seal_cases WHERE status='resolved'"
+            ).fetchone()
+        disposed = int(row["b"]) if row and row["b"] is not None else 0
+        return self.find_audit_break(after_id=disposed)
+
+    def create_seal_case(self, break_event_id: int, discovered_by: str, reason: str,
+                         evidence_summary: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO seal_cases(break_event_id, discovered_by, reason,
+                   evidence_summary, status, created_at) VALUES(?,?,?,?,?,?)""",
+                (break_event_id, discovered_by, reason, evidence_summary,
+                 SEAL_STATUSES[0], now),
+            )
+            seal_id = int(cur.lastrowid)
+            rows = self.conn.execute(
+                "SELECT DISTINCT entity_id FROM audit_events WHERE id>=? AND entity_type=?",
+                (break_event_id, ENTITY),
+            ).fetchall()
+            for row in rows:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO seal_frozen_items(seal_id, item_id) VALUES(?,?)",
+                    (seal_id, int(row["entity_id"])),
+                )
+        return self.get_seal_case(seal_id)
+
+    def get_seal_case(self, seal_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM seal_cases WHERE id=?", (seal_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("处置单不存在")
+        return dict(row)
+
+    def list_seal_cases(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM seal_cases ORDER BY id DESC").fetchall()
+        return [dict(row) for row in rows]
+
+    def frozen_item_ids(self, seal_id: int) -> List[int]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT item_id FROM seal_frozen_items WHERE seal_id=? ORDER BY item_id",
+                (seal_id,),
+            ).fetchall()
+        return [int(row["item_id"]) for row in rows]
+
+    def is_item_frozen(self, item_id: int) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT 1 FROM seal_frozen_items f
+                   JOIN seal_cases c ON c.id=f.seal_id
+                   WHERE f.item_id=? AND c.status!='resolved' LIMIT 1""",
+                (item_id,),
+            ).fetchone()
+        return row is not None
+
+    def has_active_seal_case(self) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM seal_cases WHERE status!='resolved' LIMIT 1").fetchone()
+        return row is not None
+
+    def confirm_seal_case(self, seal_id: int, actor: str,
+                          scope_note: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE seal_cases SET status='confirmed', scope_note=?, confirmed_by=?,
+                   confirmed_at=? WHERE id=? AND status='open'""",
+                (scope_note, actor, now, seal_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM seal_cases WHERE id=?", (seal_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("处置单不存在")
+                raise ConflictError("处置单状态已变化，请刷新后重试")
+        return self.get_seal_case(seal_id)
+
+    def resolve_seal_case(self, seal_id: int, actor: str,
+                          resolution_note: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE seal_cases SET status='resolved', resolution_note=?, resolved_by=?,
+                   resolved_at=? WHERE id=? AND status='confirmed'""",
+                (resolution_note, actor, now, seal_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM seal_cases WHERE id=?", (seal_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("处置单不存在")
+                raise ConflictError("处置单状态已变化，请刷新后重试")
+        return self.get_seal_case(seal_id)
 
     def close(self) -> None:
         with self._lock:

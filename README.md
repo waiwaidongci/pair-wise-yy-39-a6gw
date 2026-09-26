@@ -31,8 +31,20 @@ python3 app.py --db ./data.db --port 8316
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
 - `GET /api/audit`
+- `GET /api/seal-cases`、`GET /api/seal-cases/{id}`
+- `POST /api/seal-cases`，提交`reason`和`evidence_summary`
+- `POST /api/seal-cases/{id}/confirm`，提交`scope_note`
+- `POST /api/seal-cases/{id}/resolve`，提交`resolution_note`
 
 允许角色：inspector, dam_engineer, emergency_manager, viewer。异常值比控制阈值越高，缺陷优先级越高；应急处置缺陷必须完成复检并记录证据后才能关闭。
+
+## 审计封存
+
+- 夜巡或值班员发现审计链断链后，通过`POST /api/seal-cases`建未结清处置单，系统自动定位断点事件，记录发现人、原因和证据摘要，并冻结断点之后相关缺陷的后续写入（补录、流转）。
+- 另一名应急经理（不得为发现人）通过`POST /api/seal-cases/{id}/confirm`确认影响范围；原事件始终只读，不做改写。
+- 处置完成后通过`POST /api/seal-cases/{id}/resolve`结清并记录恢复说明，冻结解除；建单、确认、结清均写入审计链。
+- 结清视为处置了该断点及之前的全部异常；同一断点结清后不能重复建单。
+- `GET /api/seal-cases`查看冻结项与处置进度，演示页同步展示。
 
 ## 测试
 

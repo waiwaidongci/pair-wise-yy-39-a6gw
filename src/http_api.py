@@ -98,6 +98,15 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path == "/api/seal-cases":
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, {"cases": service.list_seal_cases(role)})
+                elif path.startswith("/api/seal-cases/"):
+                    seal_id = int(path.rsplit("/", 1)[-1])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_seal_case(seal_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -119,6 +128,14 @@ def make_handler(service: Service, static_dir: str):
                     expected = body.get("expected_version")
                     self._json(200, service.transition(
                         item_id, target, expected, actor, role))
+                elif path == "/api/seal-cases":
+                    self._json(201, service.report_seal_case(body, actor, role))
+                elif path.startswith("/api/seal-cases/") and path.endswith("/confirm"):
+                    seal_id = int(path.split("/")[3])
+                    self._json(200, service.confirm_seal_case(seal_id, body, actor, role))
+                elif path.startswith("/api/seal-cases/") and path.endswith("/resolve"):
+                    seal_id = int(path.split("/")[3])
+                    self._json(200, service.resolve_seal_case(seal_id, body, actor, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
