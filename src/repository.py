@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ENTITY, ID_PREFIX, STATES
 
 
 class Repository:
@@ -63,6 +63,24 @@ class Repository:
                     detail TEXT NOT NULL,
                     previous_hash TEXT NOT NULL,
                     entry_hash TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS seal_cases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    status TEXT NOT NULL CHECK(status IN ('open','confirmed','resolved')),
+                    broken_event_id INTEGER NOT NULL,
+                    break_detail TEXT NOT NULL,
+                    discovered_by TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    evidence_summary TEXT NOT NULL,
+                    scope_note TEXT,
+                    confirmed_by TEXT,
+                    confirmed_at TEXT,
+                    locked_through_event_id INTEGER,
+                    resolution_note TEXT,
+                    resolved_by TEXT,
+                    resolved_at TEXT,
+                    resume_event_id INTEGER,
                     created_at TEXT NOT NULL
                 );
             """)
@@ -192,23 +210,151 @@ class Repository:
             result.append(item)
         return result
 
-    def verify_audit_chain(self) -> bool:
+    def find_chain_breaks(self, after_event_id: int = 0) -> List[Dict[str, Any]]:
         from .audit import calculate_hash
         with self._lock:
-            rows = self.conn.execute("SELECT * FROM audit_events ORDER BY id").fetchall()
-        previous = "GENESIS"
+            rows = self.conn.execute(
+                "SELECT * FROM audit_events WHERE id>? ORDER BY id", (after_event_id,)
+            ).fetchall()
+            boundary = None
+            if after_event_id:
+                boundary = self.conn.execute(
+                    "SELECT entry_hash FROM audit_events WHERE id=?", (after_event_id,)
+                ).fetchone()
+        previous = boundary["entry_hash"] if boundary else "GENESIS"
+        breaks: List[Dict[str, Any]] = []
         for row in rows:
             if row["previous_hash"] != previous:
-                return False
-            payload = {
-                "action": row["action"], "entity_type": row["entity_type"],
-                "entity_id": row["entity_id"], "actor": row["actor"],
-                "detail": json.loads(row["detail"]), "created_at": row["created_at"],
-            }
-            if calculate_hash(previous, payload) != row["entry_hash"]:
-                return False
+                breaks.append({
+                    "event_id": row["id"], "reason": "previous_hash与前一事件不衔接",
+                    "expected_previous": previous, "actual_previous": row["previous_hash"],
+                })
+            else:
+                payload = {
+                    "action": row["action"], "entity_type": row["entity_type"],
+                    "entity_id": row["entity_id"], "actor": row["actor"],
+                    "detail": json.loads(row["detail"]), "created_at": row["created_at"],
+                }
+                digest = calculate_hash(previous, payload)
+                if digest != row["entry_hash"]:
+                    breaks.append({
+                        "event_id": row["id"], "reason": "entry_hash校验失败",
+                        "expected_hash": digest, "actual_hash": row["entry_hash"],
+                    })
             previous = row["entry_hash"]
-        return True
+        return breaks
+
+    def verify_audit_chain(self) -> bool:
+        return not self.find_chain_breaks()
+
+    def last_audit_event_id(self) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT id FROM audit_events ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return int(row["id"]) if row else 0
+
+    def affected_item_ids(self, broken_event_id: int,
+                          through_event_id: Optional[int] = None) -> List[int]:
+        sql = """SELECT DISTINCT entity_id FROM audit_events
+                 WHERE entity_type=? AND id>=?"""
+        params: list = [ENTITY, broken_event_id]
+        if through_event_id:
+            sql += " AND id<=?"
+            params.append(through_event_id)
+        sql += " ORDER BY entity_id"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [int(row["entity_id"]) for row in rows]
+
+    @staticmethod
+    def _seal(row: sqlite3.Row) -> Dict[str, Any]:
+        item = dict(row)
+        item["break_detail"] = json.loads(item["break_detail"])
+        return item
+
+    def create_seal_case(self, broken_event_id: int, break_detail: Dict[str, Any],
+                         discovered_by: str, reason: str,
+                         evidence_summary: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO seal_cases(status, broken_event_id, break_detail, discovered_by,
+                   reason, evidence_summary, created_at) VALUES('open',?,?,?,?,?,?)""",
+                (broken_event_id,
+                 json.dumps(break_detail, ensure_ascii=False, sort_keys=True),
+                 discovered_by, reason, evidence_summary, now),
+            )
+            case_id = int(cur.lastrowid)
+        return self.get_seal_case(case_id)
+
+    def get_seal_case(self, case_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM seal_cases WHERE id=?", (case_id,)).fetchone()
+        if row is None:
+            raise NotFoundError("处置单不存在")
+        return self._seal(row)
+
+    def list_seal_cases(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM seal_cases ORDER BY id DESC").fetchall()
+        return [self._seal(row) for row in rows]
+
+    def active_seal_case(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM seal_cases WHERE status IN ('open','confirmed')
+                   ORDER BY id DESC LIMIT 1""").fetchone()
+        return self._seal(row) if row else None
+
+    def latest_resolved_seal_case(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT * FROM seal_cases WHERE status='resolved'
+                   ORDER BY id DESC LIMIT 1""").fetchone()
+        return self._seal(row) if row else None
+
+    def confirm_seal_case(self, case_id: int, scope_note: str, confirmer: str,
+                          locked_through_event_id: int) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE seal_cases SET status='confirmed', scope_note=?, confirmed_by=?,
+                   confirmed_at=?, locked_through_event_id=? WHERE id=? AND status='open'""",
+                (scope_note, confirmer, now, locked_through_event_id, case_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM seal_cases WHERE id=?", (case_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("处置单不存在")
+                raise ConflictError("处置单状态已变化，请刷新后重试")
+        return self.get_seal_case(case_id)
+
+    def resolve_seal_case(self, case_id: int, resolution_note: str,
+                          resolver: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE seal_cases SET status='resolved', resolution_note=?, resolved_by=?,
+                   resolved_at=? WHERE id=? AND status='confirmed'""",
+                (resolution_note, resolver, now, case_id),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM seal_cases WHERE id=?", (case_id,)).fetchone()
+                if exists is None:
+                    raise NotFoundError("处置单不存在")
+                raise ConflictError("处置单状态已变化，请刷新后重试")
+        return self.get_seal_case(case_id)
+
+    def set_seal_resume_event(self, case_id: int, event_id: int) -> Dict[str, Any]:
+        with self._lock, self.conn:
+            self.conn.execute(
+                "UPDATE seal_cases SET resume_event_id=? WHERE id=?", (event_id, case_id))
+        return self.get_seal_case(case_id)
 
     def close(self) -> None:
         with self._lock:

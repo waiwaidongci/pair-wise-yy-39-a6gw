@@ -10,6 +10,7 @@ class ValidationError(DomainError): kind=ErrorKind.VALIDATION
 class NotFoundError(DomainError): kind=ErrorKind.NOT_FOUND
 class PermissionDenied(DomainError): kind=ErrorKind.FORBIDDEN
 class ConflictError(DomainError): kind=ErrorKind.CONFLICT
+class FrozenError(ConflictError): kind=ErrorKind.CONFLICT
 SEVERITIES=['observation', 'minor', 'major', 'emergency']; STATES=['planned', 'inspected', 'defect_confirmed', 'repair', 'verified', 'closed']; ROLES=['inspector', 'dam_engineer', 'emergency_manager', 'viewer']
 @dataclass(frozen=True)
 class Item:
@@ -20,6 +21,9 @@ class Record:
 @dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
+@dataclass(frozen=True)
+class SealCase:
+    id:int; status:str; broken_event_id:int; break_detail:Dict[str,Any]; discovered_by:str; reason:str; evidence_summary:str; scope_note:Optional[str]; confirmed_by:Optional[str]; confirmed_at:Optional[str]; locked_through_event_id:Optional[int]; resolution_note:Optional[str]; resolved_by:Optional[str]; resolved_at:Optional[str]; resume_event_id:Optional[int]; created_at:str
 def require_text(value,field,max_length=2000):
     if not isinstance(value,str) or not value.strip(): raise ValidationError(f"{field}不能为空")
     value=value.strip()

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from .domain import ConflictError, ValidationError
+from .domain import ConflictError, PermissionDenied, ValidationError
 TITLE='大坝巡检、缺陷与应急管理'; ENTITY='大坝缺陷'; ID_PREFIX='DS'
 SEVERITIES=['observation', 'minor', 'major', 'emergency']; STATES=['planned', 'inspected', 'defect_confirmed', 'repair', 'verified', 'closed']; TRANSITIONS={'planned': ['inspected'], 'inspected': ['defect_confirmed'], 'defect_confirmed': ['repair'], 'repair': ['verified'], 'verified': ['closed'], 'closed': []}; TRANSITION_ROLES={'inspected': ['inspector'], 'defect_confirmed': ['dam_engineer'], 'repair': ['dam_engineer'], 'verified': ['inspector'], 'closed': ['emergency_manager']}
 CREATE_ROLES=set(['inspector']); RECORD_ROLES=set(['inspector', 'dam_engineer']); AUDIT_ROLES=set(['emergency_manager', 'viewer']); VIEW_ROLES=set(['inspector', 'dam_engineer', 'emergency_manager', 'viewer'])
@@ -20,3 +20,11 @@ def validate_transition(current,target):
     if not can_transition(current,target): raise ConflictError(f"不能从{current}转换到{target}")
 def completion_blockers(target,open_records): return ["仍有未关闭事项"] if target in TERMINAL_STATES and open_records>0 else []
 def role_for_transition(target): return set(TRANSITION_ROLES.get(target,[]))
+SEAL_ENTITY='审计封存处置单'; SEAL_STATES=['open','confirmed','resolved']; SEAL_TRANSITIONS={'open':['confirmed'],'confirmed':['resolved'],'resolved':[]}; ACTIVE_SEAL_STATES=set(['open','confirmed'])
+SEAL_REPORT_ROLES=set(['inspector','dam_engineer','emergency_manager']); SEAL_CONFIRM_ROLES=set(['emergency_manager']); SEAL_RESOLVE_ROLES=set(['emergency_manager'])
+def validate_seal_transition(current,target):
+    if current not in SEAL_STATES or target not in SEAL_STATES: raise ValidationError("未知处置状态")
+    if target not in SEAL_TRANSITIONS.get(current,[]): raise ConflictError(f"处置单不能从{current}转换到{target}")
+def seal_writes_frozen(case): return case is not None and case["status"] in ACTIVE_SEAL_STATES
+def ensure_independent_confirmer(discoverer,confirmer):
+    if discoverer==confirmer: raise PermissionDenied("影响范围必须由另一名应急经理确认")
